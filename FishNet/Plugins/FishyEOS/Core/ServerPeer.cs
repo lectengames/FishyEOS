@@ -125,6 +125,10 @@ namespace FishNet.Transporting.FishyEOSPlugin
         /// </summary>
         private void OnPeerConnectionRequest(ref OnIncomingConnectionRequestInfo data)
         {
+            // A peer that restarted (crash, new process) asks again while its old connection is still listed:
+            // drop the old one first, otherwise its packets keep going to the dead connection id.
+            DropConnectionsOf(data.RemoteUserId, "new connection request");
+
             var nextId = _latestId++;
             var clientConnection = new Connection(nextId, data.LocalUserId, data.RemoteUserId, data.SocketId);
             _clients.Add(clientConnection);
@@ -208,31 +212,64 @@ namespace FishNet.Transporting.FishyEOSPlugin
         /// </summary>
         private void OnPeerConnectionClosed(ref OnRemoteConnectionClosedInfo data)
         {
-            Connection? clientConnection = null;
-            for (int i = _clients.Count - 1; i >= 0; i--)
-            {
-                if(data.RemoteUserId != _clients[i].RemoteUserId)
-                    continue;
-                
-                clientConnection = _clients[i];
-            }
-
-            if (!clientConnection.HasValue)
+            var remoteUserId = data.RemoteUserId;
+            if (!_clients.Any(x => x.RemoteUserId == remoteUserId))
             {
                 Debug.LogWarningFormat("[ServerPeer.OnPeerConnectionClosed] Failed to find connection for remote user id {0}.", data.RemoteUserId);
                 return;
             }
-            
+
             if (_closePeerConnectionEventHandles.TryGetValue(data.RemoteUserId.ToString(), out ulong notificationId))
             {
-                RemoveClosePeerConnectionHandle(data.RemoteUserId.ToString(), notificationId);
+                // The EOS plugin can throw here when notification ids of different interfaces collide; FishNet must
+                // still learn that the client is gone.
+                try
+                {
+                    RemoveClosePeerConnectionHandle(data.RemoteUserId.ToString(), notificationId);
+                }
+                catch (Exception e)
+                {
+                    _closePeerConnectionEventHandles.Remove(data.RemoteUserId.ToString());
+                    Debug.LogWarningFormat("[ServerPeer.OnPeerConnectionClosed] Removing close handle #{0} failed: {1}", notificationId, e.Message);
+                }
             }
 
-            _transport.HandleRemoteConnectionState(new RemoteConnectionStateArgs(RemoteConnectionState.Stopped,
-                clientConnection.Value.Id, _transport.Index));
-            _transport.NetworkManager.Log($"[ServerPeer.OnPeerConnectionClosed] Closed connection from {data.RemoteUserId} with handle #{data.SocketId} and connection id {clientConnection.Value.Id}.");
-            
-            _clients.Remove(clientConnection.Value);
+            DropConnectionsOf(data.RemoteUserId, $"closed ({data.Reason})");
+
+            // The connection stays locally accepted after the peer is gone. A restarted peer would then be connected by
+            // EOS without a connection request, and the server would never hear of it. Closing un-accepts the peer, so
+            // its next attempt raises OnPeerConnectionRequest again.
+            var closeConnectionOptions = new CloseConnectionOptions
+            {
+                SocketId = _socketId,
+                LocalUserId = _localUserId,
+                RemoteUserId = data.RemoteUserId,
+            };
+            EOS.GetCachedP2PInterface()?.CloseConnection(ref closeConnectionOptions);
+        }
+
+        /// <summary>
+        /// Removes every listed connection of a remote user and tells FishNet it stopped.
+        /// </summary>
+        private void DropConnectionsOf(ProductUserId remoteUserId, string why)
+        {
+            for (int i = _clients.Count - 1; i >= 0; i--)
+            {
+                var clientConnection = _clients[i];
+                if (clientConnection.RemoteUserId != remoteUserId)
+                    continue;
+
+                _clients.RemoveAt(i);
+                if (_establishPeerConnectionEventHandles.TryGetValue(clientConnection, out var establishedHandle))
+                {
+                    EOS.GetCachedP2PInterface()?.RemoveNotifyPeerConnectionEstablished(establishedHandle);
+                    _establishPeerConnectionEventHandles.Remove(clientConnection);
+                }
+
+                _transport.HandleRemoteConnectionState(new RemoteConnectionStateArgs(RemoteConnectionState.Stopped,
+                    clientConnection.Id, _transport.Index));
+                _transport.NetworkManager.Log($"[ServerPeer.DropConnectionsOf] Dropped connection id {clientConnection.Id} of {remoteUserId}: {why}.");
+            }
         }
 
         private void RemoveClosePeerConnectionHandle(string remoteUserId, ulong notificationId)
@@ -355,17 +392,18 @@ namespace FishNet.Transporting.FishyEOSPlugin
             for (ulong i = 0; i < incomingPacketCount; i++)
                 if (Receive(_localUserId, out var remoteUserId, out var data, out var channel))
                 {
-                    int index = 0;
+                    // The newest connection of this remote user, in case an older one is still listed.
+                    int index = _clients.Count - 1;
                     bool hasFoundId = false;
                     int connectionId = 0;
-                    while (index < _clients.Count && !hasFoundId)
+                    while (index >= 0 && !hasFoundId)
                     {
                         if (_clients[index].RemoteUserId == remoteUserId)
                         {
                             hasFoundId = true;
                             connectionId = _clients[index].Id;
                         }
-index++;
+                        index--;
                     }
 
                     if (!hasFoundId) //prevent failures of not getting an id...FishyEOS didn't handle this
